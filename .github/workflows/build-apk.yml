@@ -1,0 +1,181 @@
+# FileX Studio - WORKFLOW B: APK build
+#
+# Builds the extracted project. It never extracts the source ZIP.
+# Run it manually from the Actions tab (workflow_dispatch) or let a push that touches
+# the Android project files start it.
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: "Also build the release APK (only runs when the signing secrets exist)"
+        required: false
+        default: true
+        type: boolean
+  push:
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build debug (and release if signed) APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify the project has been extracted
+        run: |
+          if [ ! -f settings.gradle.kts ] || [ ! -d app ]; then
+            echo "::error::Android project not found in the repository root. Run the 'Extract Project ZIP' workflow first."
+            exit 1
+          fi
+
+      # The Gradle version always comes from the project's own wrapper properties.
+      - name: Read Gradle version from the wrapper properties
+        id: wrapper
+        run: |
+          set -euo pipefail
+          props=gradle/wrapper/gradle-wrapper.properties
+          if [ ! -f "$props" ]; then
+            echo "::error::$props is missing"
+            exit 1
+          fi
+          version="$(sed -n 's#.*gradle-\([0-9][0-9.]*\)-\(bin\|all\)\.zip.*#\1#p' "$props" | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the Gradle version from $props"
+            exit 1
+          fi
+          echo "Gradle version from wrapper properties: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::gradlew / gradle-wrapper.jar are not in the repository; they will be generated for this run only."
+          fi
+
+      # AGP 8.7.x requires JDK 17.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          set -eo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ] || [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "::error::Android command-line tools were not found on this runner (ANDROID_HOME='$SDK')"
+            exit 1
+          fi
+          echo "Android SDK: $SDK"
+          # Accept all licences (yes exits with SIGPIPE once sdkmanager stops reading).
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      # gradle-version is only set when the wrapper has to be generated.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ steps.wrapper.outputs.needs_bootstrap == 'true' && steps.wrapper.outputs.version || '' }}
+
+      - name: Generate Gradle wrapper (only if missing)
+        if: steps.wrapper.outputs.needs_bootstrap == 'true'
+        env:
+          GRADLE_VERSION: ${{ steps.wrapper.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          (cd "$tmp" && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin)
+          mkdir -p gradle/wrapper
+          cp "$tmp/gradlew" "$tmp/gradlew.bat" .
+          cp "$tmp/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+          echo "Generated wrapper for Gradle $GRADLE_VERSION (the project's gradle-wrapper.properties was not changed)"
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Prepare release signing (optional)
+        id: signing
+        env:
+          WANT_RELEASE: ${{ github.event_name != 'workflow_dispatch' || inputs.build_release }}
+          KS_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$WANT_RELEASE" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Release build not requested." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "$KS_BASE64" ] || [ -z "$KS_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Release APK skipped: signing secrets are not configured (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD). Only the debug APK is built." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KS_BASE64" | base64 --decode > "$keystore"
+          {
+            echo "FILEX_KEYSTORE_PATH=$keystore"
+            echo "FILEX_KEYSTORE_PASSWORD=$KS_PASSWORD"
+            echo "FILEX_KEY_ALIAS=$KEY_ALIAS"
+            echo "FILEX_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "Release signing configured from repository secrets."
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace --console=plain
+
+      - name: Build release APK
+        if: steps.signing.outputs.enabled == 'true'
+        run: ./gradlew assembleRelease --stacktrace --console=plain
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Build-Reports
+          path: app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove release keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
