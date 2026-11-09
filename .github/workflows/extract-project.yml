@@ -1,0 +1,326 @@
+# FileX Studio - WORKFLOW A: ZIP extraction (bootstrap)
+#
+# Upload THIS file to .github/workflows/extract-project.yml on the default branch,
+# upload FileXStudio-Source.zip to input/FileXStudio.zip, then run it from the Actions tab.
+#
+# This workflow only validates the ZIP, extracts it into the repository root and commits.
+# It never runs Gradle, never installs the Android SDK and never builds an APK.
+name: Extract Project ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path of the ZIP inside this repository"
+        required: false
+        default: "input/FileXStudio.zip"
+        type: string
+      remove_zip:
+        description: "Delete the ZIP from the repository after a successful extraction"
+        required: false
+        default: false
+        type: boolean
+
+# Minimum permission needed to commit the extracted files.
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-project
+  cancel-in-progress: false
+
+env:
+  MAX_FILES: "20000"
+  MAX_TOTAL_MB: "512"
+
+jobs:
+  extract:
+    name: Extract ZIP into repository root
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # GITHUB_TOKEN cannot push changes to .github/workflows/*. If you want the ZIP's
+      # build-apk.yml committed automatically, add a repository secret EXTRACT_PUSH_TOKEN
+      # (a personal access token with the "workflow" scope). Without it everything except
+      # .github/workflows/* is committed and the workflow files are reported as skipped.
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.EXTRACT_PUSH_TOKEN || github.token }}
+
+      - name: Check push token
+        id: token
+        env:
+          PAT: ${{ secrets.EXTRACT_PUSH_TOKEN }}
+        run: |
+          if [ -n "$PAT" ]; then
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+            echo "EXTRACT_PUSH_TOKEN is set: workflow files from the ZIP will be committed."
+          else
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+            echo "EXTRACT_PUSH_TOKEN is not set: files under .github/workflows/ will be skipped."
+          fi
+
+      - name: Locate ZIP
+        id: locate
+        env:
+          INPUT_ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          ZIP_REL="${INPUT_ZIP_PATH:-input/FileXStudio.zip}"
+          case "$ZIP_REL" in
+            /*|*..*) echo "::error::zip_path must be a relative path inside the repository (got '$ZIP_REL')"; exit 1 ;;
+          esac
+          ZIP_ABS="$(realpath -m "$GITHUB_WORKSPACE/$ZIP_REL")"
+          case "$ZIP_ABS" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) echo "::error::zip_path resolves outside the repository"; exit 1 ;;
+          esac
+          if [ ! -f "$ZIP_ABS" ]; then
+            echo "::error::ZIP not found at '$ZIP_REL'. Upload FileXStudio-Source.zip to that path first."
+            exit 1
+          fi
+          echo "ZIP: $ZIP_REL"
+          echo "Size: $(stat -c %s "$ZIP_ABS") bytes"
+          echo "SHA-256: $(sha256sum "$ZIP_ABS" | cut -d' ' -f1)"
+          {
+            echo "zip_rel=$ZIP_REL"
+            echo "zip_abs=$ZIP_ABS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate ZIP
+        env:
+          ZIP_PATH: ${{ steps.locate.outputs.zip_abs }}
+        run: |
+          python3 - <<'PY'
+          import os, stat, sys, zipfile
+
+          zip_path = os.environ["ZIP_PATH"]
+          max_files = int(os.environ["MAX_FILES"])
+          max_total = int(os.environ["MAX_TOTAL_MB"]) * 1024 * 1024
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          if not zipfile.is_zipfile(zip_path):
+              fail("The file is not a valid ZIP archive")
+
+          with zipfile.ZipFile(zip_path) as zf:
+              infos = zf.infolist()
+              if not infos:
+                  fail("The ZIP archive is empty")
+
+              files = 0
+              total = 0
+              for info in infos:
+                  name = info.filename.replace("\\", "/")
+                  if "\x00" in name:
+                      fail(f"Entry name contains a NUL byte: {info.filename!r}")
+                  if name.startswith("/") or (len(name) > 1 and name[1] == ":"):
+                      fail(f"Absolute path in ZIP (ZIP Slip protection): {info.filename}")
+                  if ".." in [p for p in name.split("/") if p not in ("", ".")]:
+                      fail(f"Path traversal entry rejected (ZIP Slip protection): {info.filename}")
+                  if stat.S_ISLNK(info.external_attr >> 16):
+                      fail(f"Symbolic links are not allowed in the ZIP: {info.filename}")
+                  if not info.is_dir():
+                      files += 1
+                      total += info.file_size
+
+              if files == 0:
+                  fail("The ZIP contains directories only, no files")
+              if files > max_files:
+                  fail(f"Too many files in ZIP: {files} (limit {max_files})")
+              if total > max_total:
+                  fail(f"Uncompressed size {total} bytes exceeds the limit of {max_total} bytes")
+
+              bad = zf.testzip()
+              if bad is not None:
+                  fail(f"Corrupted ZIP entry (CRC mismatch): {bad}")
+
+              print(f"ZIP is valid: {files} files, {total} bytes uncompressed")
+          PY
+
+      - name: Extract to staging area
+        id: stage
+        env:
+          ZIP_PATH: ${{ steps.locate.outputs.zip_abs }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil, sys, zipfile
+
+          zip_path = os.environ["ZIP_PATH"]
+          stage = pathlib.Path(os.environ["RUNNER_TEMP"]) / "fx-stage"
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+          stage_real = stage.resolve()
+
+          IGNORED_NAMES = {".DS_Store", "Thumbs.db"}
+          count = 0
+          skipped_git = False
+          with zipfile.ZipFile(zip_path) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if not parts:
+                      continue
+                  if parts[0] == "__MACOSX" or parts[-1] in IGNORED_NAMES:
+                      continue
+                  if ".git" in parts:
+                      skipped_git = True
+                      continue
+                  target = stage.joinpath(*parts)
+                  resolved = target.resolve()
+                  if resolved != stage_real and stage_real not in resolved.parents:
+                      fail(f"Entry escapes the extraction directory: {info.filename}")
+                  if info.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as src, open(target, "wb") as dst:
+                      shutil.copyfileobj(src, dst)
+                  mode = (info.external_attr >> 16) & 0o777
+                  os.chmod(target, 0o755 if mode & 0o111 else 0o644)
+                  count += 1
+
+          if skipped_git:
+              print("::warning::Entries inside .git directories were ignored")
+          print(f"Extracted {count} files into the staging area")
+
+          # Detect and remove an unnecessary wrapper directory (e.g. FileXStudio/FileXStudio/app).
+          MARKERS = ("settings.gradle.kts", "settings.gradle", "gradlew", "build.gradle.kts", "build.gradle")
+
+
+          def has_markers(path):
+              return any((path / m).exists() for m in MARKERS)
+
+
+          root = stage
+          for _ in range(4):
+              if has_markers(root):
+                  break
+              entries = list(root.iterdir())
+              dirs = [e for e in entries if e.is_dir()]
+              if len(entries) == 1 and len(dirs) == 1:
+                  print(f"Unwrapping single top-level directory: {dirs[0].name}/")
+                  root = dirs[0]
+                  continue
+              break
+
+          if not ((root / "settings.gradle.kts").exists() or (root / "settings.gradle").exists()):
+              top = ", ".join(sorted(e.name for e in root.iterdir())) or "(empty)"
+              fail(
+                  "No Gradle settings file (settings.gradle.kts) found at the project root. "
+                  f"Top-level entries: {top}"
+              )
+          if not (root / "app").is_dir():
+              print("::warning::No app/ directory at the project root; is this the FileX Studio project?")
+
+          print(f"Project root inside ZIP: {root.relative_to(stage) or '.'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"source_root={root}\n")
+          PY
+
+      - name: Sync into repository root
+        env:
+          SOURCE_ROOT: ${{ steps.stage.outputs.source_root }}
+          HAS_PAT: ${{ steps.token.outputs.has_pat }}
+        run: |
+          python3 - <<'PY'
+          import filecmp, os, pathlib, shutil, sys
+
+          repo = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          src_root = pathlib.Path(os.environ["SOURCE_ROOT"])
+          has_pat = os.environ.get("HAS_PAT") == "true"
+
+          # Never touched: git metadata, the ZIP input folder and this workflow itself.
+          PROTECTED_FILES = {".github/workflows/extract-project.yml"}
+          PROTECTED_PREFIXES = (".git/", "input/")
+
+          new = updated = unchanged = 0
+          skipped = []
+
+          for path in sorted(src_root.rglob("*")):
+              if path.is_dir():
+                  continue
+              rel = path.relative_to(src_root).as_posix()
+              if rel in PROTECTED_FILES or rel.startswith(PROTECTED_PREFIXES):
+                  skipped.append((rel, "protected path"))
+                  continue
+              if rel.startswith(".github/workflows/") and not has_pat:
+                  skipped.append((rel, "GITHUB_TOKEN cannot push workflow files; set EXTRACT_PUSH_TOKEN or upload it manually"))
+                  continue
+              dest = (repo / rel).resolve()
+              if repo not in dest.parents:
+                  print(f"::error::Refusing to write outside the repository: {rel}")
+                  sys.exit(1)
+              try:
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  if dest.exists():
+                      if filecmp.cmp(path, dest, shallow=False):
+                          unchanged += 1
+                          continue
+                      shutil.copy2(path, dest)
+                      updated += 1
+                  else:
+                      shutil.copy2(path, dest)
+                      new += 1
+              except OSError as exc:
+                  print(f"::error::Could not write {rel}: {exc}")
+                  sys.exit(1)
+
+          print(f"New: {new}  Updated: {updated}  Unchanged: {unchanged}  Skipped: {len(skipped)}")
+          for rel, reason in skipped:
+              level = "warning" if reason.startswith("GITHUB_TOKEN") else "notice"
+              print(f"::{level}::Skipped {rel} ({reason})")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as fh:
+                  fh.write("## Extraction result\n\n")
+                  fh.write(f"- New files: {new}\n- Updated files: {updated}\n- Unchanged files: {unchanged}\n")
+                  if skipped:
+                      fh.write("\n### Skipped\n\n")
+                      for rel, reason in skipped:
+                          fh.write(f"- `{rel}`: {reason}\n")
+          PY
+
+      - name: Commit and push changes
+        env:
+          ZIP_REL: ${{ steps.locate.outputs.zip_rel }}
+          REMOVE_ZIP: ${{ inputs.remove_zip }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "$REMOVE_ZIP" = "true" ] && [ -f "$ZIP_REL" ]; then
+            git rm -q -f -- "$ZIP_REL"
+            echo "Removed $ZIP_REL after extraction"
+          fi
+
+          [ -f gradlew ] && chmod +x gradlew
+          git add -A
+          [ -f gradlew ] && git update-index --chmod=+x gradlew
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit. Repository already matches the ZIP."
+            exit 0
+          fi
+
+          git status --short | head -n 60
+          git commit -q -m "chore: extract FileX Studio project from ZIP" -m "Source: $ZIP_REL"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "Pushed extracted project to $BRANCH"
+          
